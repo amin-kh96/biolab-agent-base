@@ -40,15 +40,19 @@ _PROTOCOL_DESIGN_KEYWORDS = (
 )
 
 
-_SYSTEM_PROMPT_TEMPLATE = """You are an autonomous laboratory agent. You help plan and run experiments \
-using the tools listed below. Think step by step and call tools to gather evidence before answering.
+_SYSTEM_PROMPT_TEMPLATE = """You are an autonomous biological laboratory agent. You help plan and run experiments using the tools listed below. 
 
 AVAILABLE TOOLS:
 {tool_summaries}
 
 PROTOCOL
-Every turn you output EXACTLY one JSON object  -  nothing else, no prose, no markdown fences.
-Exactly one of these two shapes:
+You operate in a strict loop of Thought, Action, and Observation.
+
+1. Thought: You must ALWAYS explain your reasoning and plan your next steps. Use this scratchpad to think about what tools you need to use, especially if multiple steps are required (like retrieving a protocol and then composing one).
+2. Action: Choose EXACTLY ONE action to perform.
+3. Observation: The system will return the result of your action.
+
+When outputting an Action, you must output EXACTLY ONE JSON object and nothing else. Choose one of these two shapes:
 
   {{"tool": "<tool_name>", "arguments": {{ ... }}}}
       Call a tool. Use the argument names from the tool's schema.
@@ -59,18 +63,11 @@ Exactly one of these two shapes:
       Return the final answer. ALWAYS include `structured` (may be empty) and `citations` (may be empty).
 
 CRITICAL RULES
-- Never include prose outside the JSON. No ```json fences.
-- When the user provides `Available image_ids: [...]`, you MUST call segment_wells ONCE PER image_id,
-  then return `{{"final": "...", "structured": {{"cell_count": {{"<image_id>": <n>}}, "confluency": {{"<image_id>": <pct>}}}}}}`.
-  Use the tool's `cell_count` and `confluency_pct` fields VERBATIM  -  do not round or invent values.
-- When the user asks you to design / compose / draft a protocol, you MUST call `compose_protocol`
-  exactly once (no need to retrieve beforehand) with at least: `title`, `labware`, `pipettes`,
-  `reagents`. Then return `{{"final": "...", "structured": <compose_protocol output>}}`.
-  compose_protocol is REQUIRED for any protocol-design task  -  do not end without calling it.
-- For retrieval-style tasks (the user asks you to find/retrieve a protocol), call retrieve_protocol
-  ONCE and return `{{"final": "...", "citations": [[doc_id, chunk_id], ...]}}` using the hits.
+- You MUST output "Thought: [your reasoning]" followed immediately by your JSON Action block.
+- When the user provides `Available image_ids: [...]`, you MUST call segment_wells ONCE PER image_id, then return `{{"final": "...", "structured": {{"cell_count": {{"<image_id>": <n>}}, "confluency": {{"<image_id>": <pct>}}}}}}`. Use the tool's `cell_count` and `confluency_pct` fields VERBATIM.
+- When the user asks you to design / compose / draft a protocol, you MUST call `compose_protocol` exactly once with at least: `title`, `labware`, `pipettes`, `reagents`. compose_protocol is REQUIRED for any protocol-design task.
+- For retrieval-style tasks, call retrieve_protocol ONCE and return `{{"final": "...", "citations": [[doc_id, chunk_id], ...]}}`.
 - Do NOT call retrieve_protocol more than twice for a single task.
-- Do NOT invent data. If lookup_reagent returns null, say so explicitly.
 - Stop after at most {max_iter} tool calls.
 """
 
@@ -226,6 +223,10 @@ class BaselineAgent(BaseAgent):
         query: str,
         image_ids: list[str] | None = None,
     ) -> AgentResult:
+        import re
+        import json
+        import time
+        
         start = time.perf_counter()
         trace: list[ToolTrace] = []
         confluency: dict[str, float] = {}
@@ -251,9 +252,17 @@ class BaselineAgent(BaseAgent):
             )
             assistant_raw = resp["message"]["content"]
             messages.append({"role": "assistant", "content": assistant_raw})
-            parsed = _extract_json(assistant_raw)
+            
+            # --- ReAct JSON Parsing Injection ---
+            parsed = None
+            match = re.search(r"(\{.*?\})", assistant_raw, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    pass
+            
             if parsed is None:
-                # Model failed to produce JSON  -  stop and keep whatever we have.
                 final_answer = assistant_raw.strip() or "Agent produced no parseable output."
                 break
 
@@ -269,67 +278,24 @@ class BaselineAgent(BaseAgent):
 
             tool = parsed.get("tool")
             args = parsed.get("arguments") or parsed.get("args") or {}
+            
             if not tool or tool not in TOOL_IMPLS:
-                trace.append(
-                    ToolTrace(
-                        step=step,
-                        tool=str(tool or "<unknown>"),
-                        args=args,
-                        ok=False,
-                        error=f"Unknown tool {tool!r}",
-                    )
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "content": json.dumps(
-                            {
-                                "error": f"Unknown tool {tool!r}. Valid tools: {list(TOOL_IMPLS)}.",
-                            }
-                        ),
-                    }
-                )
+                trace.append(ToolTrace(step=step, tool=str(tool or "<unknown>"), args=args, ok=False, error=f"Unknown tool {tool!r}"))
+                messages.append({"role": "tool", "content": json.dumps({"error": f"Unknown tool {tool!r}. Valid tools: {list(TOOL_IMPLS)}."})})
                 continue
 
             t0 = time.perf_counter()
             try:
                 result = TOOL_IMPLS[tool](**args)
                 observation = _serialize(result)
-                trace.append(
-                    ToolTrace(
-                        step=step,
-                        tool=tool,
-                        args=args,
-                        ok=True,
-                        observation=observation,
-                        elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
-                    )
-                )
+                trace.append(ToolTrace(step=step, tool=tool, args=args, ok=True, observation=observation, elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2)))
             except Exception as exc:
-                trace.append(
-                    ToolTrace(
-                        step=step,
-                        tool=tool,
-                        args=args,
-                        ok=False,
-                        error=f"{type(exc).__name__}: {exc}",
-                        elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2),
-                    )
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "content": json.dumps({"tool": tool, "error": str(exc)}),
-                    }
-                )
+                trace.append(ToolTrace(step=step, tool=tool, args=args, ok=False, error=f"{type(exc).__name__}: {exc}", elapsed_ms=round((time.perf_counter() - t0) * 1000.0, 2)))
+                messages.append({"role": "tool", "content": json.dumps({"tool": tool, "error": str(exc)})})
                 continue
 
-            # Auto-aggregate well-known results so the final structured output
-            # is close to what the harness expects even if the model forgets.
             if tool == "segment_wells":
                 for mask in observation.get("masks", []):
-                    # Prefer the requested image_id over the per-mask well_id
-                    # (they coincide today but may diverge for multi-well plates).
                     wid = args.get("image_id") or mask.get("well_id")
                     if wid:
                         confluency[str(wid)] = float(mask.get("confluency_pct", 0.0))
@@ -342,39 +308,24 @@ class BaselineAgent(BaseAgent):
             elif tool == "compose_protocol":
                 structured = {k: v for k, v in observation.items() if v is not None}
 
-            # Strip heavy byproducts (RLE strings) before feeding back to the LLM  -
-            # they are not useful for planning and blow up the context.
             light_observation = _strip_heavy(observation)
-            messages.append(
-                {
-                    "role": "tool",
-                    "content": json.dumps({"tool": tool, "observation": light_observation})[:6000],
-                }
-            )
+            messages.append({"role": "tool", "content": json.dumps({"tool": tool, "observation": light_observation})[:6000]})
+            
         else:
-            final_answer = (
-                final_answer or "Max iterations reached before the agent emitted a final answer."
-            )
+            final_answer = final_answer or "Max iterations reached before the agent emitted a final answer."
 
         if confluency or cell_counts:
-            # Real tool outputs beat whatever the LLM put in structured  -
-            # small models tend to hallucinate plausible-looking numbers
-            # and forget to use the measured values.
             structured = dict(structured or {})
             if confluency:
                 structured["confluency"] = {**structured.get("confluency", {}), **confluency}
             if cell_counts:
                 structured["cell_count"] = {**structured.get("cell_count", {}), **cell_counts}
 
-        # Adapter scoping: polish the structured protocol only when the task
-        # actually asks for a designed protocol. Avoids the adapter's narrow
-        # training hurting tool-calling behaviour on the other task kinds.
         if self.config.lora_adapter and self._is_protocol_design(query):
             polished = self._polish_with_adapter(query)
             if polished:
                 structured = {**(structured or {}), **polished}
 
-        # Deduplicate citations while preserving order.
         seen: set[tuple[str, str]] = set()
         unique_cites: list[tuple[str, str]] = []
         for c in citations:
