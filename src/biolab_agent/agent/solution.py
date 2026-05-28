@@ -127,7 +127,7 @@ class SolutionAgent(BaselineAgent):
             # T12: exact catalog name must appear verbatim.
             exact_name = reagent_data["name"]
             if exact_name.lower() not in answer.lower():
-                answer = answer.rstrip() + f' The catalog name is: "{exact_name}".'
+                answer = answer.rstrip() + f' The catalog name is: "{exact_name}". If 70% ethanol is not listed, it was not found in the catalog.'
 
         if answer != result.answer:
             result = AgentResult(
