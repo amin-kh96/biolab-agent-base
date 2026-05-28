@@ -245,7 +245,9 @@ class SolutionAgent(BaselineAgent):
             return result
 
         answer = result.answer or ""
-        raw = reagent_trace.observation if hasattr(reagent_trace, "observation") else str(reagent_trace.args)
+        raw = reagent_trace.observation if (hasattr(reagent_trace, "observation") and reagent_trace.observation is not None) else str(reagent_trace.args) or ""
+        if raw is None:
+            raw = ""
 
         # Try to parse catalog result as JSON
         import json, re
